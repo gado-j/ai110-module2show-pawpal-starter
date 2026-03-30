@@ -32,6 +32,22 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+## Smarter Scheduling
+
+The scheduling engine was extended beyond the basic greedy algorithm with four improvements:
+
+**Sort by time**
+`Scheduler.sort_by_time()` orders any task list by `preferred_time` (earliest first), using priority as a tiebreaker within the same time slot. Tasks with no preferred time are pushed to the end. This lets the UI render a time-ordered view independently of how tasks were added.
+
+**Filter by pet and status**
+`Scheduler.filter_tasks(pet_name, completed)` returns a filtered slice of all tasks. Both parameters are optional — pass one, both, or neither. `filter_by_pet()` and `filter_by_priority()` offer quick single-axis lookups.
+
+**Recurring task support**
+Tasks carry a `frequency` field (`"once"`, `"daily"`, `"weekly"`). `generate_recurring_tasks()` excludes completed one-time tasks while always surfacing daily and weekly ones. When a recurring task is marked complete via `Scheduler.complete_task()`, a fresh copy is automatically created and added back to the pet's task list for the next scheduling cycle.
+
+**Conflict detection**
+`get_all_conflicts()` performs a pairwise scan of all scheduled tasks and returns every overlapping pair with the overlap duration and whether the clash is within the same pet or across pets. `warn_conflicts()` wraps this into plain warning strings — no exceptions, no crashing — so callers only need `if warnings:` to handle the result.
+
 ### Suggested workflow
 
 1. Read the scenario carefully and identify requirements and edge cases.

@@ -38,6 +38,26 @@ class Task:
         """Mark this task as completed."""
         self.is_completed = True
 
+    def next_occurrence(self, new_id: int) -> Optional["Task"]:
+        """Return a fresh, incomplete copy of this task for its next occurrence.
+
+        Returns None for one-time tasks — they don't repeat.
+        The new task inherits all settings (duration, priority, preferred_time)
+        but starts with is_completed=False so it appears in the next schedule.
+        """
+        if self.frequency == "once":
+            return None
+        return Task(
+            id=new_id,
+            title=self.title,
+            duration_minutes=self.duration_minutes,
+            priority=self.priority,
+            frequency=self.frequency,
+            preferred_time=self.preferred_time,
+            is_completed=False,
+            pet_name=self.pet_name,
+        )
+
     def is_high_priority(self) -> bool:
         """Return True if the task's priority is high."""
         return self.priority == "high"
@@ -101,6 +121,34 @@ class Scheduler:
         self.owner = owner
         self.pets: List[Pet] = []
         self.scheduled_tasks: List[ScheduledTask] = []
+        self.skipped_tasks: List[Task] = []
+        self._next_task_id: int = 1000  # start high to avoid collisions with user-created IDs
+
+    def complete_task(self, task_id: int) -> Optional[Task]:
+        """Mark a task complete and, if it recurs, add the next occurrence to its pet.
+
+        Returns the new Task if one was created, or None for one-time tasks.
+        Raises ValueError if no task with the given ID is found.
+        """
+        all_tasks = self.get_all_tasks()
+        task = next((t for t in all_tasks if t.id == task_id), None)
+        if task is None:
+            raise ValueError(f"No task with id={task_id} found.")
+
+        task.mark_complete()
+
+        next_task = task.next_occurrence(new_id=self._next_task_id)
+        if next_task is None:
+            return None  # one-time task, nothing more to do
+
+        self._next_task_id += 1
+
+        # Add the next occurrence back to the same pet
+        pet = next((p for p in self.pets if p.name == task.pet_name), None)
+        if pet:
+            pet.add_task(next_task)
+
+        return next_task
 
     def add_pet(self, pet: Pet):
         """Register a pet with the scheduler."""
@@ -110,46 +158,189 @@ class Scheduler:
         """Return a flat list of all tasks across every registered pet."""
         return [task for pet in self.pets for task in pet.get_tasks()]
 
+    def generate_recurring_tasks(self) -> List[Task]:
+        """Return the subset of tasks eligible to be scheduled today.
+
+        Rules:
+        - "once" tasks that are already completed are excluded — they are done forever.
+        - "daily" and "weekly" tasks are always included regardless of completion
+          status, because they need to appear in every applicable schedule cycle.
+        """
+        eligible = []
+        for task in self.get_all_tasks():
+            if task.frequency == "once" and task.is_completed:
+                continue
+            eligible.append(task)
+        return eligible
+
+    def filter_by_priority(self, priority: str) -> List[Task]:
+        """Return all tasks across all pets that match the given priority level.
+
+        Args:
+            priority: One of "high", "medium", or "low".
+        """
+        return [t for t in self.get_all_tasks() if t.priority == priority]
+
+    def filter_by_pet(self, pet_name: str) -> List[Task]:
+        """Return all tasks belonging to the named pet.
+
+        Args:
+            pet_name: The exact name of the pet as registered with add_pet().
+        """
+        return [t for t in self.get_all_tasks() if t.pet_name == pet_name]
+
     def build_schedule(self) -> List[ScheduledTask]:
-        """Sort all tasks by priority and assign them to time slots within the owner's window."""
-        tasks = self._sort_by_priority(self.get_all_tasks())
-        self.scheduled_tasks = self._assign_time_slots(tasks)
+        """Build today's schedule: filter recurring, sort, assign slots, track skipped."""
+        tasks = self._sort_by_priority(self.generate_recurring_tasks())
+        self.scheduled_tasks, self.skipped_tasks = self._assign_time_slots(tasks)
         return self.scheduled_tasks
 
     def _sort_by_priority(self, tasks: List[Task]) -> List[Task]:
-        """Return tasks ordered high → medium → low priority."""
-        return sorted(tasks, key=lambda t: PRIORITY_ORDER.get(t.priority, 99))
+        """Return tasks ordered high → medium → low, using preferred_time as a tiebreaker.
 
-    def _assign_time_slots(self, tasks: List[Task]) -> List[ScheduledTask]:
-        """Greedily assign start times to tasks, skipping any that exceed the available window."""
+        The sort key is a tuple (priority_rank, preferred_time). Python sorts
+        tuples left to right, so priority is always the primary criterion.
+        Tasks with no preferred_time are treated as time(23, 59) and drift
+        to the end within their priority band.
+        """
+        def sort_key(t: Task):
+            priority_rank = PRIORITY_ORDER.get(t.priority, 99)
+            time_rank = t.preferred_time if t.preferred_time else time(23, 59)
+            return (priority_rank, time_rank)
+        return sorted(tasks, key=sort_key)
+
+    def filter_tasks(
+        self,
+        pet_name: Optional[str] = None,
+        completed: Optional[bool] = None,
+    ) -> List[Task]:
+        """Return tasks filtered by pet name and/or completion status.
+
+        Args:
+            pet_name:  If provided, only return tasks belonging to this pet.
+            completed: If True, return only completed tasks.
+                       If False, return only incomplete tasks.
+                       If None, completion status is not filtered.
+        """
+        tasks = self.get_all_tasks()
+        if pet_name is not None:
+            tasks = [t for t in tasks if t.pet_name == pet_name]
+        if completed is not None:
+            tasks = [t for t in tasks if t.is_completed == completed]
+        return tasks
+
+    def sort_by_time(self, tasks: List[Task]) -> List[Task]:
+        """Return tasks sorted by preferred_time, earliest first.
+
+        Useful for displaying a time-ordered view independently of how the
+        greedy scheduler placed tasks. The sort key is a tuple so that tasks
+        sharing the same preferred_time are further ordered by priority.
+
+        Tasks with no preferred_time are placed at the end (sorted as time.max).
+
+        Args:
+            tasks: Any list of Task objects — need not belong to this scheduler.
+        """
+        return sorted(tasks, key=lambda t: (
+            t.preferred_time or time.max,
+            PRIORITY_ORDER.get(t.priority, 99),
+        ))
+
+    def _assign_time_slots(self, tasks: List[Task]):
+        """Greedily assign start times to tasks within the owner's available window.
+
+        Iterates tasks in the order given (caller is responsible for pre-sorting).
+        Each task is placed immediately after the previous one. If a task would
+        push past available_end it is added to the skipped list instead.
+
+        Returns:
+            A tuple of (scheduled, skipped) — both are lists, never None.
+        """
         scheduled = []
+        skipped = []
         current_dt = datetime.combine(datetime.today(), self.owner.available_start)
         end_dt = datetime.combine(datetime.today(), self.owner.available_end)
 
         for task in tasks:
             task_end_dt = current_dt + timedelta(minutes=task.duration_minutes)
             if task_end_dt > end_dt:
-                continue  # not enough time left in the day
+                skipped.append(task)
+                continue
 
+            freq_note = f" (recurring: {task.frequency})" if task.frequency != "once" else ""
             reason = (
                 f"Scheduled at {current_dt.strftime('%I:%M %p')} — "
-                f"{task.priority} priority, fits in remaining window."
+                f"{task.priority} priority, fits in remaining window{freq_note}."
             )
             scheduled.append(ScheduledTask(task=task, start_time=current_dt.time(), reason=reason))
             current_dt = task_end_dt
 
-        return scheduled
+        return scheduled, skipped
 
-    def check_conflicts(self, task: Task) -> bool:
-        """Return True if the given task overlaps with any already-scheduled task."""
+    def check_conflicts(self, task: Task, proposed_start: time) -> bool:
+        """Return True if placing task at proposed_start overlaps any already-scheduled task."""
+        new_start_dt = datetime.combine(datetime.today(), proposed_start)
+        new_end_dt = new_start_dt + timedelta(minutes=task.duration_minutes)
+
         for st in self.scheduled_tasks:
             existing_start = datetime.combine(datetime.today(), st.start_time)
             existing_end = datetime.combine(datetime.today(), st.end_time)
-            new_end = datetime.combine(datetime.today(), self.owner.available_start) + timedelta(minutes=task.duration_minutes)
-            # a conflict exists if the ranges overlap
-            if existing_start < new_end and existing_end > existing_start:
+            if new_start_dt < existing_end and new_end_dt > existing_start:
                 return True
         return False
+
+    def get_all_conflicts(self) -> List[dict]:
+        """Scan all scheduled tasks pairwise and return every overlapping pair.
+
+        Each conflict is a dict with:
+          - 'task_a', 'task_b': the two ScheduledTask objects
+          - 'same_pet': True if both tasks belong to the same pet
+          - 'overlap_minutes': how many minutes the two slots overlap
+        """
+        today = datetime.today()
+        conflicts = []
+
+        for i, a in enumerate(self.scheduled_tasks):
+            a_start = datetime.combine(today, a.start_time)
+            a_end = datetime.combine(today, a.end_time)
+
+            for b in self.scheduled_tasks[i + 1:]:
+                b_start = datetime.combine(today, b.start_time)
+                b_end = datetime.combine(today, b.end_time)
+
+                overlap_start = max(a_start, b_start)
+                overlap_end = min(a_end, b_end)
+
+                if overlap_start < overlap_end:
+                    conflicts.append({
+                        "task_a": a,
+                        "task_b": b,
+                        "same_pet": a.task.pet_name == b.task.pet_name,
+                        "overlap_minutes": int((overlap_end - overlap_start).total_seconds() // 60),
+                    })
+
+        return conflicts
+
+    def warn_conflicts(self) -> List[str]:
+        """Return a list of human-readable warning strings for every scheduling conflict.
+
+        Returns an empty list when there are no conflicts — callers can treat
+        a falsy result as "all clear" without any exception handling.
+        """
+        if not self.scheduled_tasks:
+            return []
+
+        warnings = []
+        for c in self.get_all_conflicts():
+            a, b = c["task_a"], c["task_b"]
+            scope = "same pet" if c["same_pet"] else "different pets"
+            warnings.append(
+                f"WARNING: '{a.task.title}' ({a.task.pet_name}) and "
+                f"'{b.task.title}' ({b.task.pet_name}) overlap by "
+                f"{c['overlap_minutes']} min ({scope})."
+            )
+
+        return warnings
 
 
 if __name__ == "__main__":
