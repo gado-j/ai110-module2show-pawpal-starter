@@ -48,6 +48,37 @@ Tasks carry a `frequency` field (`"once"`, `"daily"`, `"weekly"`). `generate_rec
 **Conflict detection**
 `get_all_conflicts()` performs a pairwise scan of all scheduled tasks and returns every overlapping pair with the overlap duration and whether the clash is within the same pet or across pets. `warn_conflicts()` wraps this into plain warning strings — no exceptions, no crashing — so callers only need `if warnings:` to handle the result.
 
+## Testing PawPal+
+
+### Run the test suite
+
+```bash
+python -m pytest tests/test_pawpal.py -v
+```
+
+### What the tests cover
+
+The suite contains **33 tests** across 7 test classes:
+
+| Class | What it checks |
+|---|---|
+| `TestTask` | `mark_complete()`, priority flag, `fits_in_window()` boundary |
+| `TestPet` | Adding/removing tasks, `pet_name` stamping |
+| `TestOwner` | Available window tuple, total minutes calculation |
+| `TestScheduledTask` | `end_time` computation, time range, display string format |
+| `TestScheduler` | Pet registration, task flattening, schedule build order, skip-on-overflow |
+| `TestSortingCorrectness` | Chronological order, `None` preferred_time sorts last, priority tiebreak |
+| `TestRecurrenceLogic` | Daily task creates new occurrence, one-time task does not, completed tasks excluded from schedule, unique IDs across completions |
+| `TestConflictDetection` | Exact same start time flagged, warning strings, normal schedule has zero conflicts, empty schedule is safe, overlap true/false boundary |
+
+### Confidence Level
+
+**★★★★☆ (4 / 5)**
+
+The core scheduling contract — priority ordering, greedy slot assignment, recurring task lifecycle, and conflict detection — is fully covered and all 33 tests pass. One star is withheld because the Streamlit UI layer (`app.py`) has no automated tests; user-facing input handling and edge cases there are only verified manually.
+
+---
+
 ### Suggested workflow
 
 1. Read the scenario carefully and identify requirements and edge cases.

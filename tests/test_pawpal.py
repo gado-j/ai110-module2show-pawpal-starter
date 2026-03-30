@@ -148,3 +148,222 @@ class TestScheduler:
     def test_scheduled_tasks_stored_on_instance(self, scheduler_with_pets):
         schedule = scheduler_with_pets.build_schedule()
         assert scheduler_with_pets.scheduled_tasks is schedule
+
+
+# --- Sorting correctness tests ---
+
+class TestSortingCorrectness:
+    def test_sort_by_time_chronological_order(self, owner):
+        """sort_by_time() must return tasks in ascending preferred_time order.
+
+        We create three tasks with out-of-order preferred times and confirm
+        the sorted result matches the expected chronological sequence.
+        """
+        scheduler = Scheduler(owner=owner)
+        tasks = [
+            Task(id=1, title="Afternoon Walk", duration_minutes=30, priority="medium", preferred_time=time(14, 0)),
+            Task(id=2, title="Morning Walk",   duration_minutes=30, priority="medium", preferred_time=time(8, 0)),
+            Task(id=3, title="Evening Walk",   duration_minutes=30, priority="medium", preferred_time=time(18, 0)),
+        ]
+        sorted_tasks = scheduler.sort_by_time(tasks)
+        times = [t.preferred_time for t in sorted_tasks]
+        assert times == [time(8, 0), time(14, 0), time(18, 0)]
+
+    def test_sort_by_time_none_preferred_time_goes_last(self, owner):
+        """Tasks with no preferred_time must sort after all tasks that have one.
+
+        None is treated as time.max so it never jumps ahead of a real time.
+        """
+        scheduler = Scheduler(owner=owner)
+        tasks = [
+            Task(id=1, title="No Time Task", duration_minutes=20, priority="high", preferred_time=None),
+            Task(id=2, title="Morning Task",  duration_minutes=20, priority="high", preferred_time=time(9, 0)),
+        ]
+        sorted_tasks = scheduler.sort_by_time(tasks)
+        assert sorted_tasks[0].title == "Morning Task"
+        assert sorted_tasks[1].title == "No Time Task"
+
+    def test_sort_by_time_same_time_tiebreak_by_priority(self, owner):
+        """When two tasks share a preferred_time, higher priority must come first.
+
+        The sort key is (preferred_time, priority_rank), so "high" (rank 0)
+        beats "low" (rank 2) when times are equal.
+        """
+        scheduler = Scheduler(owner=owner)
+        tasks = [
+            Task(id=1, title="Low Task",  duration_minutes=20, priority="low",  preferred_time=time(9, 0)),
+            Task(id=2, title="High Task", duration_minutes=20, priority="high", preferred_time=time(9, 0)),
+        ]
+        sorted_tasks = scheduler.sort_by_time(tasks)
+        assert sorted_tasks[0].title == "High Task"
+        assert sorted_tasks[1].title == "Low Task"
+
+
+# --- Recurrence logic tests ---
+
+class TestRecurrenceLogic:
+    def test_complete_daily_task_creates_new_task(self, owner):
+        """Completing a daily task must add a fresh, incomplete copy to the pet's task list.
+
+        After complete_task() the pet should have two tasks: the original
+        (completed) and the new occurrence (incomplete). This confirms the
+        scheduler will include the task again on the next build cycle.
+        """
+        pet = Pet(name="Luna", species="dog", age=3)
+        pet.add_task(Task(id=1, title="Morning Walk", duration_minutes=30,
+                          priority="high", frequency="daily"))
+        scheduler = Scheduler(owner=owner)
+        scheduler.add_pet(pet)
+
+        new_task = scheduler.complete_task(task_id=1)
+
+        assert new_task is not None                  # a next occurrence was created
+        assert new_task.is_completed is False        # starts fresh — not already done
+        assert new_task.frequency == "daily"         # inherits the recurrence setting
+        assert new_task.id != 1                      # gets a distinct ID, not a duplicate
+        assert len(pet.get_tasks()) == 2             # original + new occurrence both on pet
+
+    def test_complete_once_task_does_not_create_new_task(self, owner):
+        """Completing a one-time task must NOT add a next occurrence.
+
+        next_occurrence() returns None for frequency='once', so the pet's
+        task count must stay the same after completion.
+        """
+        pet = Pet(name="Luna", species="dog", age=3)
+        pet.add_task(Task(id=2, title="Vet Visit", duration_minutes=60,
+                          priority="high", frequency="once"))
+        scheduler = Scheduler(owner=owner)
+        scheduler.add_pet(pet)
+
+        new_task = scheduler.complete_task(task_id=2)
+
+        assert new_task is None                  # no recurrence for one-time tasks
+        assert len(pet.get_tasks()) == 1         # list unchanged — original task only
+
+    def test_completed_once_task_excluded_from_schedule(self, owner):
+        """A completed one-time task must be filtered out of the next build_schedule().
+
+        generate_recurring_tasks() skips 'once' tasks where is_completed=True,
+        so they should not appear in the returned schedule.
+        """
+        pet = Pet(name="Luna", species="dog", age=3)
+        pet.add_task(Task(id=3, title="One-off Groom", duration_minutes=20,
+                          priority="medium", frequency="once"))
+        scheduler = Scheduler(owner=owner)
+        scheduler.add_pet(pet)
+        scheduler.complete_task(task_id=3)
+
+        schedule = scheduler.build_schedule()
+        titles = [st.task.title for st in schedule]
+        assert "One-off Groom" not in titles
+
+    def test_new_recurring_task_id_is_unique(self, owner):
+        """Each call to complete_task() must yield a strictly increasing new ID.
+
+        _next_task_id starts at 1000 and increments after each recurring
+        completion, so two consecutive completions must produce different IDs.
+        """
+        pet = Pet(name="Luna", species="dog", age=3)
+        pet.add_task(Task(id=10, title="Walk A", duration_minutes=20,
+                          priority="high", frequency="daily"))
+        pet.add_task(Task(id=11, title="Walk B", duration_minutes=20,
+                          priority="high", frequency="daily"))
+        scheduler = Scheduler(owner=owner)
+        scheduler.add_pet(pet)
+
+        new_a = scheduler.complete_task(task_id=10)
+        new_b = scheduler.complete_task(task_id=11)
+        assert new_a.id != new_b.id
+
+
+# --- Conflict detection tests ---
+
+class TestConflictDetection:
+    def _make_overlapping_scheduler(self, owner):
+        """Helper: return a scheduler whose scheduled_tasks list contains two
+        overlapping ScheduledTask objects injected directly (bypassing the
+        greedy algorithm, which would never produce overlaps on its own)."""
+        task_a = Task(id=1, title="Walk",    duration_minutes=60, priority="high", pet_name="Luna")
+        task_b = Task(id=2, title="Feeding", duration_minutes=30, priority="high", pet_name="Luna")
+        scheduler = Scheduler(owner=owner)
+        # Inject overlapping slots manually: both start at 09:00, so they fully overlap
+        scheduler.scheduled_tasks = [
+            ScheduledTask(task=task_a, start_time=time(9, 0)),
+            ScheduledTask(task=task_b, start_time=time(9, 0)),
+        ]
+        return scheduler
+
+    def test_get_all_conflicts_detects_exact_same_start_time(self, owner):
+        """Two tasks at the same start time must be flagged as a conflict.
+
+        This is the clearest duplicate-time case: task_b starts exactly when
+        task_a starts, so the overlap equals task_b's full duration (30 min).
+        """
+        scheduler = self._make_overlapping_scheduler(owner)
+        conflicts = scheduler.get_all_conflicts()
+
+        assert len(conflicts) == 1
+        assert conflicts[0]["overlap_minutes"] == 30   # task_b's 30-min duration fully overlaps
+
+    def test_warn_conflicts_returns_non_empty_list(self, owner):
+        """warn_conflicts() must return at least one warning string when there is an overlap.
+
+        The string should mention both task titles so the owner knows which
+        tasks are the problem.
+        """
+        scheduler = self._make_overlapping_scheduler(owner)
+        warnings = scheduler.warn_conflicts()
+
+        assert len(warnings) > 0
+        assert "Walk" in warnings[0]
+        assert "Feeding" in warnings[0]
+
+    def test_no_conflicts_in_normal_schedule(self, scheduler_with_pets):
+        """The greedy scheduler must never produce overlapping slots.
+
+        build_schedule() places each task sequentially, so get_all_conflicts()
+        should always return an empty list for a normally-built schedule.
+        """
+        scheduler_with_pets.build_schedule()
+        assert scheduler_with_pets.get_all_conflicts() == []
+
+    def test_warn_conflicts_empty_when_no_scheduled_tasks(self, owner):
+        """warn_conflicts() on an empty schedule must return [] without errors.
+
+        Callers rely on a falsy return value meaning 'all clear', so an empty
+        list (not an exception) is the correct response here.
+        """
+        scheduler = Scheduler(owner=owner)
+        assert scheduler.warn_conflicts() == []
+
+    def test_check_conflicts_true_when_overlapping(self, owner):
+        """check_conflicts() must return True when a proposed task overlaps the schedule.
+
+        We schedule a 60-min task at 09:00 (runs until 10:00), then check
+        whether a new task proposed at 09:30 would conflict — it should.
+        """
+        existing_task = Task(id=1, title="Long Walk", duration_minutes=60,
+                             priority="high", pet_name="Luna")
+        scheduler = Scheduler(owner=owner)
+        scheduler.scheduled_tasks = [ScheduledTask(task=existing_task, start_time=time(9, 0))]
+
+        new_task = Task(id=2, title="Feeding", duration_minutes=20,
+                        priority="medium", pet_name="Milo")
+        # Proposed at 09:30 — inside the 09:00–10:00 window of the existing task
+        assert scheduler.check_conflicts(new_task, proposed_start=time(9, 30)) is True
+
+    def test_check_conflicts_false_when_not_overlapping(self, owner):
+        """check_conflicts() must return False when the proposed slot is clear.
+
+        The existing task ends at 10:00; a new task proposed at 10:00 starts
+        exactly when the old one ends — back-to-back is not an overlap.
+        """
+        existing_task = Task(id=1, title="Long Walk", duration_minutes=60,
+                             priority="high", pet_name="Luna")
+        scheduler = Scheduler(owner=owner)
+        scheduler.scheduled_tasks = [ScheduledTask(task=existing_task, start_time=time(9, 0))]
+
+        new_task = Task(id=2, title="Feeding", duration_minutes=20,
+                        priority="medium", pet_name="Milo")
+        # Proposed at 10:00 — exactly when the previous task finishes, no overlap
+        assert scheduler.check_conflicts(new_task, proposed_start=time(10, 0)) is False
