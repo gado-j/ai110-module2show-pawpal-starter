@@ -367,3 +367,96 @@ class TestConflictDetection:
                         priority="medium", pet_name="Milo")
         # Proposed at 10:00 — exactly when the previous task finishes, no overlap
         assert scheduler.check_conflicts(new_task, proposed_start=time(10, 0)) is False
+
+
+# --- find_next_slot tests ---
+
+class TestFindNextSlot:
+    def test_empty_schedule_returns_window_start(self, owner):
+        """With no tasks scheduled, the first open slot is the start of the owner's window.
+
+        The gap-scan sees no occupied intervals, so the only candidate is
+        available_start (08:00). A short task must fit immediately.
+        """
+        scheduler = Scheduler(owner=owner)
+        task = Task(id=1, title="Walk", duration_minutes=30, priority="high")
+        assert scheduler.find_next_slot(task) == time(8, 0)
+
+    def test_returns_slot_after_existing_task(self, owner):
+        """A task that fills 08:00–09:00 should push the next slot to 09:00.
+
+        The gap-scan adds each task's end_time as a candidate. After a 60-min
+        task starting at 08:00, the next candidate is 09:00 and must be returned.
+        """
+        scheduler = Scheduler(owner=owner)
+        blocker = Task(id=1, title="Long Walk", duration_minutes=60,
+                       priority="high", pet_name="Luna")
+        scheduler.scheduled_tasks = [ScheduledTask(task=blocker, start_time=time(8, 0))]
+
+        new_task = Task(id=2, title="Feeding", duration_minutes=20, priority="medium")
+        assert scheduler.find_next_slot(new_task) == time(9, 0)
+
+    def test_finds_gap_between_two_tasks(self, owner):
+        """A free gap between two scheduled tasks must be preferred over the tail slot.
+
+        Schedule: Walk 08:00–08:30, Grooming 09:00–09:20 (30-min gap at 08:30).
+        A 20-min task must fit in the 08:30 gap rather than after 09:20.
+        """
+        scheduler = Scheduler(owner=owner)
+        task_a = Task(id=1, title="Walk",     duration_minutes=30, priority="high",   pet_name="Luna")
+        task_b = Task(id=2, title="Grooming", duration_minutes=20, priority="medium", pet_name="Luna")
+        scheduler.scheduled_tasks = [
+            ScheduledTask(task=task_a, start_time=time(8, 0)),   # ends 08:30
+            ScheduledTask(task=task_b, start_time=time(9, 0)),   # starts 09:00 → 30-min gap
+        ]
+
+        new_task = Task(id=3, title="Feeding", duration_minutes=20, priority="medium")
+        # 20 min fits in the 08:30–09:00 gap (30 min wide)
+        assert scheduler.find_next_slot(new_task) == time(8, 30)
+
+    def test_skips_gap_too_small_and_finds_next(self, owner):
+        """When a gap exists but is too narrow, the scan must continue to the next gap.
+
+        Schedule: Walk 08:00–08:30, Grooming 08:40–09:00 (only 10-min gap at 08:30).
+        A 20-min task cannot fit in 10 minutes, so it must land after 09:00.
+        """
+        scheduler = Scheduler(owner=owner)
+        task_a = Task(id=1, title="Walk",     duration_minutes=30, priority="high",   pet_name="Luna")
+        task_b = Task(id=2, title="Grooming", duration_minutes=20, priority="medium", pet_name="Luna")
+        scheduler.scheduled_tasks = [
+            ScheduledTask(task=task_a, start_time=time(8, 0)),   # ends 08:30
+            ScheduledTask(task=task_b, start_time=time(8, 40)),  # 10-min gap — too small for 20 min
+        ]
+
+        new_task = Task(id=3, title="Feeding", duration_minutes=20, priority="medium")
+        assert scheduler.find_next_slot(new_task) == time(9, 0)
+
+    def test_returns_none_when_window_is_full(self, owner):
+        """When no gap is large enough, find_next_slot must return None, not crash.
+
+        A single task that fills the entire 720-min window leaves no room for
+        anything else — the method must return None cleanly.
+        """
+        scheduler = Scheduler(owner=owner)
+        # 720 min = exactly 08:00–20:00, the full window
+        blocker = Task(id=1, title="All Day", duration_minutes=720,
+                       priority="high", pet_name="Luna")
+        scheduler.scheduled_tasks = [ScheduledTask(task=blocker, start_time=time(8, 0))]
+
+        new_task = Task(id=2, title="Walk", duration_minutes=30, priority="medium")
+        assert scheduler.find_next_slot(new_task) is None
+
+    def test_task_fits_exactly_at_end_of_window(self, owner):
+        """A task that fills the remaining window exactly must be returned, not rejected.
+
+        If 30 minutes remain and the task is 30 minutes, it fits (end == window_end
+        is allowed by the <= comparison). Off-by-one errors would return None here.
+        """
+        scheduler = Scheduler(owner=owner)
+        # Fill 08:00–19:30 (690 min), leaving exactly 30 min until 20:00
+        blocker = Task(id=1, title="Big Task", duration_minutes=690,
+                       priority="high", pet_name="Luna")
+        scheduler.scheduled_tasks = [ScheduledTask(task=blocker, start_time=time(8, 0))]
+
+        tight_task = Task(id=2, title="Walk", duration_minutes=30, priority="medium")
+        assert scheduler.find_next_slot(tight_task) == time(19, 30)

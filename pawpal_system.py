@@ -342,6 +342,62 @@ class Scheduler:
 
         return warnings
 
+    def find_next_slot(self, task: Task) -> Optional[time]:
+        """Return the earliest start time within the owner's window where task fits gap-free.
+
+        Unlike the greedy builder, which only appends to the end of the current
+        schedule, this method scans every gap in the existing schedule and returns
+        the first opening wide enough to hold the task's duration — including gaps
+        between already-scheduled tasks, not just the tail.
+
+        Algorithm (gap-scan):
+          1. Collect the occupied intervals from scheduled_tasks and sort by start.
+          2. Build a list of candidate start times:
+               - available_start  (the gap before the first task)
+               - each task's end_time  (the gap immediately after each task)
+          3. For each candidate in chronological order:
+               a. Skip it if it falls before available_start.
+               b. Compute the deadline for this gap: the start of the next occupied
+                  task, or available_end if there is no next task.
+               c. If candidate + task.duration <= deadline, this gap fits — return it.
+          4. Return None if no gap in the window is large enough.
+
+        Args:
+            task: The task whose duration_minutes must fit in the returned slot.
+
+        Returns:
+            A time object for the earliest fitting start, or None if no slot exists.
+        """
+        today = datetime.today()
+        window_start = datetime.combine(today, self.owner.available_start)
+        window_end   = datetime.combine(today, self.owner.available_end)
+
+        # Sort occupied intervals by start time
+        occupied = sorted(
+            self.scheduled_tasks,
+            key=lambda st: datetime.combine(today, st.start_time),
+        )
+
+        # Candidate start times: beginning of window + immediately after each task
+        candidates = [window_start] + [
+            datetime.combine(today, st.end_time) for st in occupied
+        ]
+
+        # The "wall" after each candidate: the next task's start, or the window end
+        walls = [
+            datetime.combine(today, occupied[i].start_time) if i < len(occupied) else window_end
+            for i in range(len(candidates))
+        ]
+
+        for candidate, wall in zip(candidates, walls):
+            if candidate < window_start:
+                continue
+            task_end = candidate + timedelta(minutes=task.duration_minutes)
+            if task_end <= wall and task_end <= window_end:
+                return candidate.time()
+
+        return None
+
 
 if __name__ == "__main__":
     owner = Owner(name="Jordan", available_start=time(8, 0), available_end=time(20, 0))
