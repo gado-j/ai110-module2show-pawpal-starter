@@ -90,13 +90,19 @@ This tradeoff is reasonable for a daily pet care app for two reasons. First, the
 
 **a. How you used AI**
 
-- How did you use AI tools during this project (for example: design brainstorming, debugging, refactoring)?
-- What kinds of prompts or questions were most helpful?
+AI was used throughout every phase of this project, but in different ways depending on the stage.
+
+During design, I used it for brainstorming — asking it to identify the main objects needed and what attributes and methods each one should have. This was most useful for surfacing things I hadn't thought of, like the missing `Task.pet_name` field and the risk of `end_time` going stale if stored as a plain attribute instead of a computed property. The most helpful prompts were specific and structural: "review this file and identify missing relationships or potential logic bottlenecks" produced actionable feedback, while open-ended prompts like "help me design a scheduler" produced generic answers.
+
+During implementation, I used AI to write class stubs from the UML diagram, then fill in method bodies one at a time. Asking it to implement a specific method (like `_assign_time_slots`) and explain the logic line by line helped me understand the algorithm rather than just copy it.
+
+During testing, I used AI to identify the 5 core behaviors most worth verifying before writing any test code. This forced a prioritization step that I would have skipped otherwise.
 
 **b. Judgment and verification**
 
-- Describe one moment where you did not accept an AI suggestion as-is.
-- How did you evaluate or verify what the AI suggested?
+The most important moment of non-acceptance was with `check_conflicts()`. The AI's original implementation used `self.owner.available_start` as the proposed start time for any task being checked — meaning every conflict check was anchored to the beginning of the day regardless of when the task was actually going to be placed. The method would have returned incorrect results in every real use case.
+
+I caught this by tracing through the logic manually with a concrete example: if the schedule already had a task from 8:00–8:30 and I wanted to check whether a new task starting at 9:00 would conflict, the method was checking 8:00–9:00 against 8:00–8:30, which always overlaps. I verified the bug was real by writing a test case that should have returned `False` (no conflict) and confirmed it returned `True`. The fix was changing the signature to `check_conflicts(task, proposed_start: time)` so the caller provides the actual proposed time.
 
 ---
 
@@ -104,13 +110,30 @@ This tradeoff is reasonable for a daily pet care app for two reasons. First, the
 
 **a. What you tested**
 
-- What behaviors did you test?
-- Why were these tests important?
+The test suite covers 20 behaviors across all five classes. The most important ones were:
+
+- **Task completion** (`test_mark_complete`): verifies that `mark_complete()` flips `is_completed` from `False` to `True`. This is the simplest test but the most foundational — if marking a task done doesn't work, the recurring logic and schedule filtering both break downstream.
+
+- **Priority ordering** (`test_build_schedule_sorted_high_before_low`): verifies that high-priority tasks appear before low-priority tasks in the final schedule. This is the primary guarantee the scheduler makes to the user.
+
+- **Skipped task tracking** (`test_build_schedule_skips_tasks_that_dont_fit`): verifies that a task exceeding the available window does not appear in the schedule. Without this, a task could silently disappear and the owner would never know it wasn't planned.
+
+- **`end_time` computation** (`test_end_time_computed_correctly`): verifies the `@property` calculates correctly from `start_time` and `duration_minutes`. This underpins every time display in the UI and the conflict detection math.
+
+- **Pet name stamping** (`test_add_task_sets_pet_name`): verifies that `Pet.add_task()` stamps `task.pet_name`. If this fails, the entire schedule output loses its ownership context.
+
+These tests matter because they cover the critical path: a task gets created, assigned to a pet, sorted by priority, placed in a time slot, and displayed. A failure anywhere in that chain produces a wrong schedule.
 
 **b. Confidence**
 
-- How confident are you that your scheduler works correctly?
-- What edge cases would you test next if you had more time?
+Confidence is moderate-high for the core scheduling path (creating tasks, sorting, placing slots, displaying results) and lower for edge cases.
+
+The greedy algorithm is well-tested for the happy path. Edge cases I would test next with more time:
+
+- **Exact adjacency**: Task A ends at 9:00 AM, Task B starts at 9:00 AM — this should NOT be a conflict, but the interval overlap condition `new_start < existing_end` needs to be verified it uses strict less-than and not less-than-or-equal.
+- **Recurring task spawning**: `complete_task()` on a `daily` task should add a new copy to the pet — this is the most complex new method and has no test yet.
+- **Empty window**: what happens if `available_start == available_end` — zero minutes available, all tasks should land in `skipped_tasks`.
+- **Single task exactly fills window**: a 720-minute task in a 720-minute window should schedule successfully, not be skipped.
 
 ---
 
@@ -118,12 +141,16 @@ This tradeoff is reasonable for a daily pet care app for two reasons. First, the
 
 **a. What went well**
 
-- What part of this project are you most satisfied with?
+The part I am most satisfied with is the separation between the logic layer (`pawpal_system.py`) and the UI layer (`app.py`). Every scheduling decision — sorting, filtering, slot assignment, conflict detection — lives in Python classes that can be imported, tested, and verified in a terminal completely independently of Streamlit. This made debugging straightforward: when something produced the wrong output, I could reproduce it in `main.py` with three lines of code instead of clicking through a web interface. The CLI-first workflow paid off most when catching the `check_conflicts()` bug — a unit test found it instantly, whereas a UI-only approach would have required manually crafting a specific scenario to trigger it.
+
+The design also evolved cleanly. Starting from a UML diagram, converting to stubs, then filling in logic one method at a time meant each step was small and reversible. The git history reflects that progression and makes it easy to see exactly what changed and why.
 
 **b. What you would improve**
 
-- If you had another iteration, what would you improve or redesign?
+The biggest thing I would redesign is the greedy scheduling algorithm. Its main weakness is that it packs all tasks to the front of the day regardless of `preferred_time`. A morning walk with `preferred_time=time(7, 0)` and an evening walk with `preferred_time=time(18, 0)` both land before 9 AM because the greedy algorithm never leaves a gap. The fix would be a time-aware placer that honors preferred windows: instead of chaining tasks back-to-back from `available_start`, it would jump the clock forward to `preferred_time` when the next task has one and enough time remains.
+
+I would also add a `Task.pet` reference rather than just `Task.pet_name`. Storing the name works, but it creates a silent inconsistency risk — if a pet is renamed, all its task labels become stale. A direct object reference would stay consistent automatically.
 
 **c. Key takeaway**
 
-- What is one important thing you learned about designing systems or working with AI on this project?
+The most important thing I learned is that designing a system on paper first genuinely changes the quality of the code. The UML diagram forced decisions — what does each class own, what does it delegate, where does the logic live — before any code existed. Those decisions were much cheaper to debate and revise as boxes and arrows than as committed Python. The classes that had clear single responsibilities in the diagram (like `Task` knowing nothing about scheduling, or `ScheduledTask` existing only to represent a placed slot) were the easiest to implement and test. The ones where responsibility was fuzzy on the diagram (`Scheduler` doing too much, `explain_plan()` duplicating `reason`) caused the most implementation pain. Design clarity upstream directly predicts implementation ease downstream.

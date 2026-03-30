@@ -5,10 +5,6 @@ from pawpal_system import Owner, Pet, Task, Scheduler
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
 
 # --- Session state initialization ---
-# st.session_state acts like a dictionary that persists across reruns.
-# The "if not in" guard ensures we only create these objects once,
-# not every time the page refreshes or a button is clicked.
-
 if "owner" not in st.session_state:
     st.session_state.owner = Owner(
         name="Jordan",
@@ -20,15 +16,20 @@ if "scheduler" not in st.session_state:
     st.session_state.scheduler = Scheduler(owner=st.session_state.owner)
 
 if "next_task_id" not in st.session_state:
-    st.session_state.next_task_id = 1  # auto-increments so every Task gets a unique id
+    st.session_state.next_task_id = 1
 
 # --- Page header ---
 st.title("🐾 PawPal+")
-st.caption(f"Owner: {st.session_state.owner.name} | Available: {st.session_state.owner.available_start.strftime('%I:%M %p')} – {st.session_state.owner.available_end.strftime('%I:%M %p')}")
+st.caption(
+    f"Owner: {st.session_state.owner.name} | "
+    f"Available: {st.session_state.owner.available_start.strftime('%I:%M %p')} – "
+    f"{st.session_state.owner.available_end.strftime('%I:%M %p')} "
+    f"({st.session_state.owner.get_total_available_time()} min)"
+)
 
 st.divider()
 
-# --- Add a Pet ---
+# ── Add a Pet ─────────────────────────────────────────────────────────────────
 st.subheader("Add a Pet")
 
 col1, col2, col3 = st.columns(3)
@@ -40,17 +41,14 @@ with col3:
     age = st.number_input("Age (years)", min_value=0, max_value=30, value=2)
 
 if st.button("Add Pet"):
-    # Check if a pet with this name already exists
     existing_names = [p.name for p in st.session_state.scheduler.pets]
     if pet_name in existing_names:
         st.warning(f"A pet named '{pet_name}' is already registered.")
     else:
         new_pet = Pet(name=pet_name, species=species, age=age)
-        # scheduler.add_pet() registers the Pet so the scheduler can manage its tasks
         st.session_state.scheduler.add_pet(new_pet)
         st.success(f"Added {pet_name} the {species}!")
 
-# Show registered pets
 if st.session_state.scheduler.pets:
     st.markdown("**Registered pets:**")
     for pet in st.session_state.scheduler.pets:
@@ -60,7 +58,7 @@ else:
 
 st.divider()
 
-# --- Add a Task ---
+# ── Add a Task ────────────────────────────────────────────────────────────────
 st.subheader("Add a Task")
 
 if not st.session_state.scheduler.pets:
@@ -74,40 +72,88 @@ else:
     with col2:
         task_title = st.text_input("Task title", value="Morning Walk")
 
-    col3, col4 = st.columns(2)
+    col3, col4, col5 = st.columns(3)
     with col3:
         duration = st.number_input("Duration (minutes)", min_value=1, max_value=240, value=30)
     with col4:
         priority = st.selectbox("Priority", ["low", "medium", "high"], index=2)
+    with col5:
+        frequency = st.selectbox("Frequency", ["once", "daily", "weekly"])
 
     if st.button("Add Task"):
-        # Find the Pet object that matches the selected name
-        target_pet = next(p for p in st.session_state.scheduler.pets if p.name == selected_pet_name)
-
-        new_task = Task(
-            id=st.session_state.next_task_id,
-            title=task_title,
-            duration_minutes=int(duration),
-            priority=priority,
+        target_pet = next(
+            (p for p in st.session_state.scheduler.pets if p.name == selected_pet_name), None
         )
-        # pet.add_task() appends the task and stamps pet_name on it
-        target_pet.add_task(new_task)
-        st.session_state.next_task_id += 1
-        st.success(f"Added '{task_title}' to {selected_pet_name}.")
+        if target_pet is None:
+            st.error("Could not find the selected pet. Please try again.")
+        else:
+            new_task = Task(
+                id=st.session_state.next_task_id,
+                title=task_title,
+                duration_minutes=int(duration),
+                priority=priority,
+                frequency=frequency,
+            )
+            target_pet.add_task(new_task)
+            st.session_state.next_task_id += 1
+            st.success(f"Added '{task_title}' ({frequency}) to {selected_pet_name}.")
 
-    # Show all current tasks grouped by pet
+    # ── Task list with filters ─────────────────────────────────────────────────
     all_tasks = st.session_state.scheduler.get_all_tasks()
     if all_tasks:
         st.markdown("**Current tasks:**")
-        rows = [
-            {"Pet": t.pet_name, "Task": t.title, "Duration (min)": t.duration_minutes, "Priority": t.priority}
-            for t in all_tasks
-        ]
-        st.table(rows)
+
+        filter_col1, filter_col2, filter_col3 = st.columns(3)
+        with filter_col1:
+            filter_pet = st.selectbox(
+                "Filter by pet", ["All"] + pet_options, key="filter_pet"
+            )
+        with filter_col2:
+            filter_status = st.selectbox(
+                "Filter by status", ["All", "Pending", "Completed"], key="filter_status"
+            )
+        with filter_col3:
+            sort_mode = st.selectbox(
+                "Sort by", ["Priority", "Preferred time"], key="sort_mode"
+            )
+
+        # Apply filters via Scheduler.filter_tasks()
+        pet_arg = None if filter_pet == "All" else filter_pet
+        completed_arg = None
+        if filter_status == "Pending":
+            completed_arg = False
+        elif filter_status == "Completed":
+            completed_arg = True
+
+        filtered = st.session_state.scheduler.filter_tasks(
+            pet_name=pet_arg, completed=completed_arg
+        )
+
+        # Apply sort
+        if sort_mode == "Preferred time":
+            display_tasks = st.session_state.scheduler.sort_by_time(filtered)
+        else:
+            display_tasks = st.session_state.scheduler._sort_by_priority(filtered)
+
+        if display_tasks:
+            rows = [
+                {
+                    "Pet": t.pet_name,
+                    "Task": t.title,
+                    "Duration (min)": t.duration_minutes,
+                    "Priority": t.priority,
+                    "Frequency": t.frequency,
+                    "Status": "Done" if t.is_completed else "Pending",
+                }
+                for t in display_tasks
+            ]
+            st.table(rows)
+        else:
+            st.info("No tasks match the selected filters.")
 
 st.divider()
 
-# --- Generate Schedule ---
+# ── Generate Schedule ─────────────────────────────────────────────────────────
 st.subheader("Generate Schedule")
 
 if st.button("Build Schedule"):
@@ -115,10 +161,46 @@ if st.button("Build Schedule"):
     if not all_tasks:
         st.warning("Add at least one task before building a schedule.")
     else:
-        # scheduler.build_schedule() sorts by priority and assigns time slots
         schedule = st.session_state.scheduler.build_schedule()
-        st.success(f"Scheduled {len(schedule)} of {len(all_tasks)} tasks.")
+        skipped = st.session_state.scheduler.skipped_tasks
+
+        # ── Conflict warnings — shown first so the owner sees them immediately ──
+        conflict_warnings = st.session_state.scheduler.warn_conflicts()
+        if conflict_warnings:
+            st.error(
+                f"**{len(conflict_warnings)} scheduling conflict(s) detected.** "
+                "Review the warnings below before following this schedule."
+            )
+            for msg in conflict_warnings:
+                st.warning(msg)
+        else:
+            st.success(
+                f"Scheduled {len(schedule)} of {len(all_tasks)} tasks — no conflicts."
+            )
+
+        # ── Skipped tasks ──────────────────────────────────────────────────────
+        if skipped:
+            st.warning(
+                f"{len(skipped)} task(s) could not fit in your available window today:"
+            )
+            for t in skipped:
+                st.caption(f"- {t.pet_name}: {t.title} ({t.duration_minutes} min, {t.priority} priority)")
+
+        # ── Schedule table ─────────────────────────────────────────────────────
         st.markdown("### Today's Schedule")
         for st_task in schedule:
-            st.markdown(f"**{st_task.to_display_string()}**")
-            st.caption(f"Reason: {st_task.reason}")
+            priority = st_task.task.priority
+            if priority == "high":
+                indicator = "🔴"
+            elif priority == "medium":
+                indicator = "🟡"
+            else:
+                indicator = "🟢"
+
+            freq_badge = (
+                f" _{st_task.task.frequency}_" if st_task.task.frequency != "once" else ""
+            )
+            st.markdown(
+                f"{indicator} **{st_task.to_display_string()}**{freq_badge}"
+            )
+            st.caption(f"↳ {st_task.reason}")
